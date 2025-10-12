@@ -158,8 +158,18 @@ def main():
         print("No rows fetched."); return
     df = pd.DataFrame(all_rows)
     os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
-    df.to_csv(OUT_CSV, index=False)
-    print(f"Wrote {len(df)} rows to {OUT_CSV}")
+
+    if os.path.exists(OUT_CSV):
+        prev = pd.read_csv(OUT_CSV)
+        combined = pd.concat([prev, df], ignore_index=True)
+        combined.drop_duplicates(subset=["date", "symbol", "expiry", "is_call", "strike"], inplace=True)
+        combined.sort_values(["date", "symbol", "expiry", "is_call", "strike"], inplace=True)
+        combined.to_csv(OUT_CSV, index=False)
+        print(f"Appended {len(df)} rows (total {len(combined)}) to {OUT_CSV}")
+    else:
+        df.sort_values(["date", "symbol", "expiry", "is_call", "strike"], inplace=True)
+        df.to_csv(OUT_CSV, index=False)
+        print(f"Wrote {len(df)} rows to {OUT_CSV}")
 
 if __name__ == "__main__":
     main()
