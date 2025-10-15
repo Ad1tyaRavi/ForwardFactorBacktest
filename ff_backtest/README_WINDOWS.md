@@ -4,7 +4,10 @@
 ```powershell
 cd C:\path\to\ff_backtest
 python -m venv venv
-.env\Scriptsctivate
+## 2) Add your AlphaVantage key
+ALPHAVANTAGE_API_KEY=YOUR_REAL_KEY
+The free tier allows 5 requests per minute. The fetch script automatically
+throttles to stay within that limit.
 pip install -r requirements.txt
 ```
 

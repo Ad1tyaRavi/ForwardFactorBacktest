@@ -1,4 +1,7 @@
+from pathlib import Path
+
 import pandas as pd
+
 from backtest import run_backtest
 
 def filter_by_iv(df, top_n=20):
@@ -9,8 +12,9 @@ def filter_by_iv(df, top_n=20):
     top_symbols = mean_iv.head(top_n).index
     return df[df['symbol'].isin(top_symbols)]
 
-# Load the full dataset
-iv = pd.read_csv("sample_data/iv_snapshots.csv", parse_dates=["date","expiry"])
+# Load the full dataset relative to this file so it works from any CWD
+DATA_PATH = Path(__file__).resolve().parent / "sample_data" / "iv_snapshots.csv"
+iv = pd.read_csv(DATA_PATH, parse_dates=["date", "expiry"])
 
 # Filter for top 20 stocks by IV
 iv_filtered = filter_by_iv(iv, top_n=20)

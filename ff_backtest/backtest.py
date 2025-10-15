@@ -20,8 +20,63 @@ def compute_ff(sig_front, sig_back, T1_days, T2_days):
     FF = forward_factor(sig_front, sig_fwd)
     return sig_fwd, FF
 
-def simulate_calendar_price(front_leg_mid, back_leg_mid):
-    return float(back_leg_mid - front_leg_mid)
+def _leg_price(mid: float, slippage_bps: float, side: str) -> float:
+    """Apply slippage to a leg depending on whether we are buying or selling."""
+    if mid is None or np.isnan(mid):
+        return np.nan
+    slip = slippage_bps / 10000.0
+    if side == "buy":
+        return float(mid * (1.0 + slip))
+    return float(mid * (1.0 - slip))
+
+
+def _calendar_mid(structure, n_call, f_call, n_put, f_put):
+    """Return the mid-price of the calendar structure without costs."""
+    if structure == "call_calendar":
+        return float(f_call["mid"] - n_call["mid"])
+    if n_put is None or f_put is None:
+        return np.nan
+    return float((f_call["mid"] - n_call["mid"]) + (f_put["mid"] - n_put["mid"]))
+
+
+def _trade_price(structure, n_call, f_call, n_put, f_put, slippage_bps, commission_per_leg, action):
+    """
+    Approximate the executable price for opening or closing a calendar.
+    `action` should be either "open" (debit) or "close" (credit).
+    """
+    slip_side_open = {
+        "open": {"far": "buy", "near": "sell"},
+        "close": {"far": "sell", "near": "buy"},
+    }
+    sides = slip_side_open.get(action)
+    if sides is None:
+        raise ValueError(f"Unsupported action '{action}'")
+
+    def call_price(n, f):
+        far_px = _leg_price(f["mid"], slippage_bps, sides["far"])
+        near_px = _leg_price(n["mid"], slippage_bps, sides["near"])
+        if np.isnan(far_px) or np.isnan(near_px):
+            return np.nan
+        return far_px - near_px
+
+    if structure == "call_calendar":
+        base = call_price(n_call, f_call)
+        legs = 2
+    else:
+        if n_put is None or f_put is None:
+            return np.nan
+        call_component = call_price(n_call, f_call)
+        buy_far_put = _leg_price(f_put["mid"], slippage_bps, sides["far"])
+        sell_near_put = _leg_price(n_put["mid"], slippage_bps, sides["near"])
+        if np.isnan(call_component) or np.isnan(buy_far_put) or np.isnan(sell_near_put):
+            return np.nan
+        base = call_component + (buy_far_put - sell_near_put)
+        legs = 4
+
+    commission = legs * commission_per_leg
+    if action == "open":
+        return float(base + commission)
+    return float(base - commission)
 
 def run_backtest(iv_df, 
                  dte_pair=(30,60),
@@ -55,48 +110,59 @@ def run_backtest(iv_df,
         snap = iv_df[(iv_df["date"]==day) & (iv_df["symbol"]==sym) & (iv_df["expiry"]==exp)]
         return snap.copy()
 
+    def price_trade_mid(trade, day):
+        near_snap = get_chain(day, trade["symbol"], trade["near_exp"])
+        far_snap = get_chain(day, trade["symbol"], trade["far_exp"])
+        if near_snap.empty or far_snap.empty:
+            return trade.get("last_mid", trade["entry_mid"])
+        und = near_snap["underlying"].iloc[0]
+        n_call, n_put = pick_atm(near_snap, und)
+        f_call, f_put = pick_atm(far_snap, und)
+        if n_call is None or f_call is None:
+            return trade.get("last_mid", trade["entry_mid"])
+        mid = _calendar_mid(trade["structure"], n_call, f_call, n_put, f_put)
+        if np.isnan(mid):
+            return trade.get("last_mid", trade["entry_mid"])
+        return float(mid)
+
+    def mark_to_market(today):
+        total = 0.0
+        for tr in open_trades:
+            price = price_trade_mid(tr, today)
+            tr["last_mid"] = price
+            total += tr["n_spreads"] * price
+        return total
+
     def close_due_trades(today):
         nonlocal cash, open_trades
-        ret_today = 0.0
         still = []
         for tr in open_trades:
             if today >= tr["exit_date"]:
                 near_snap = get_chain(today, tr["symbol"], tr["near_exp"])
                 far_snap  = get_chain(today, tr["symbol"], tr["far_exp"])
                 if near_snap.empty or far_snap.empty:
-                    # Assume total loss if data is not available for closing the trade
-                    pnl = -tr["entry_debit"]
-                    cash += tr["n_spreads"] * pnl
-                    ret_today += (tr["n_spreads"] * pnl) / max(capital, 1e-9)
-                    continue # trade is closed
+                    still.append(tr)
+                    continue
                 und = near_snap["underlying"].iloc[0]
                 n_call, n_put = pick_atm(near_snap, und)
                 f_call, f_put = pick_atm(far_snap, und)
                 if n_call is None or f_call is None:
                     still.append(tr); continue
+                exit_mid = _calendar_mid(tr["structure"], n_call, f_call, n_put, f_put)
+                exit_price = _trade_price(tr["structure"], n_call, f_call, n_put, f_put,
+                                          slippage_bps, commission_per_leg, action="close")
+                if np.isnan(exit_mid) or np.isnan(exit_price):
+                    still.append(tr); continue
 
-                if tr["structure"]=="call_calendar":
-                    exit_price = simulate_calendar_price(n_call["mid"], f_call["mid"])
-                    legs = 2
-                else:
-                    if n_put is None or f_put is None:
-                        still.append(tr); continue
-                    exit_price = simulate_calendar_price(n_call["mid"], f_call["mid"]) + simulate_calendar_price(n_put["mid"], f_put["mid"])
-                    legs = 4
-
-                exit_price = exit_price * (1.0 - slippage_bps/10000.0) - legs*commission_per_leg
                 pnl = (exit_price - tr["entry_debit"])
-                cash += tr["n_spreads"] * pnl
-                ret_today += (tr["n_spreads"] * pnl) / max(capital, 1e-9)
+                cash += tr["n_spreads"] * exit_price
             else:
                 still.append(tr)
         open_trades = still
-        return ret_today
+        return
 
     for d in dates:
-        ret_t = close_due_trades(d)
-        print(f"Date: {d}, Return: {ret_t}")
-        daily_returns.append(ret_t)
+        close_due_trades(d)
 
         if len(open_trades) < max_concurrent:
             T1, T2 = dte_pair
@@ -121,17 +187,14 @@ def run_backtest(iv_df,
                 if np.isnan(FF) or FF < min_ff:
                     continue
 
-                if structure=="call_calendar":
-                    entry_debit = (f_call["mid"] - n_call["mid"])
-                    legs = 2
-                else:
-                    if (n_put is None) or (f_put is None):
-                        continue
-                    entry_debit = (f_call["mid"] - n_call["mid"]) + (f_put["mid"] - n_put["mid"])
-                    legs = 4
+                if structure != "call_calendar" and ((n_put is None) or (f_put is None)):
+                    continue
 
-                entry_debit = entry_debit * (1.0 + slippage_bps/10000.0) + legs*commission_per_leg
-                if entry_debit <= 0: 
+                entry_mid = _calendar_mid(structure, n_call, f_call, n_put, f_put)
+                entry_debit = _trade_price(structure, n_call, f_call, n_put, f_put,
+                                           slippage_bps, commission_per_leg, action="open")
+
+                if np.isnan(entry_mid) or np.isnan(entry_debit) or entry_mid <= 0 or entry_debit <= 0:
                     continue
 
                 cands.append({
@@ -143,7 +206,9 @@ def run_backtest(iv_df,
                     "FF": float(FF),
                     "sig_fwd": float(sig_fwd),
                     "entry_debit": float(entry_debit),
-                    "structure": structure
+                    "entry_mid": float(entry_mid),
+                    "structure": structure,
+                    "legs": 2 if structure == "call_calendar" else 4
                 })
 
             cands = sorted(cands, key=lambda x: x["FF"], reverse=True)
@@ -156,9 +221,15 @@ def run_backtest(iv_df,
                     continue
                 cash -= n_spreads * price
                 tr["n_spreads"] = n_spreads
+                tr["last_mid"] = tr["entry_mid"]
                 open_trades.append(tr)
 
-        equity_curve.append(cash)
+        mtm = mark_to_market(d)
+        equity = cash + mtm
+        prev_equity = equity_curve[-1] if equity_curve else capital
+        equity_curve.append(equity)
+        baseline = prev_equity if abs(prev_equity) > 1e-9 else capital
+        daily_returns.append((equity - prev_equity) / max(baseline, 1e-9))
 
     eq = pd.Series(equity_curve, index=dates).ffill()
     rets = pd.Series(daily_returns, index=dates).fillna(0.0)
